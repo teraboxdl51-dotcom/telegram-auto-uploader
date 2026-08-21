@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
 python-multipart
-telethon
+telethon==1.44.0
+cryptg
