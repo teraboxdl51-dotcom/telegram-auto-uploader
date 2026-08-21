@@ -1,246 +1,122 @@
 import os
-import json
-import time
 import asyncio
-import hashlib
+import logging
+import mimetypes
+import tempfile
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Optional
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.errors import (
+    FloodWaitError,
+    RPCError,
+)
+from telethon.tl.types import DocumentAttributeVideo
 
 
-# =========================================================
-# CONFIG
-# =========================================================
+# ============================================================
+# LOGGING
+# ============================================================
 
-API_ID_TEXT = os.getenv("API_ID", "")
-API_HASH = os.getenv("API_HASH", "")
-CHANNEL_ID_TEXT = os.getenv("CHANNEL_ID", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "")
-
-TEMP_DIR = Path(
-    os.getenv(
-        "TEMP_DIR",
-        "/tmp/telegram_auto_uploader"
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-TEMP_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+log = logging.getLogger("telegram-auto-uploader")
 
-STATE_FILE = TEMP_DIR / "uploaded_files.json"
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+
+def env_required(name: str) -> str:
+    value = os.getenv(name)
+
+    if value is None:
+        raise RuntimeError(f"Missing Railway variable: {name}")
+
+    value = value.strip()
+
+    if not value:
+        raise RuntimeError(f"Empty Railway variable: {name}")
+
+    return value
+
+
+def load_api_id() -> int:
+    raw = env_required("TELEGRAM_API_ID")
+
+    # Accept accidental spaces/newlines.
+    raw = raw.strip()
+
+    try:
+        api_id = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            "TELEGRAM_API_ID must contain numbers only."
+        )
+
+    if api_id <= 0:
+        raise RuntimeError(
+            "TELEGRAM_API_ID must be a positive integer."
+        )
+
+    return api_id
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = env_required("CHANNEL_ID")
+SESSION_STRING = env_required("SESSION_STRING")
+TELEGRAM_API_HASH = env_required("TELEGRAM_API_HASH")
+TELEGRAM_API_ID = load_api_id()
+
+# Optional. Kept because you already have this Railway variable.
+TELEGRAM_LOCAL = os.getenv("TELEGRAM_LOCAL", "").strip()
+
+
+# ============================================================
+# LIMITS / SETTINGS
+# ============================================================
+
+# This is an application safety limit.
+# Telegram itself may impose its own limits.
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024 * 1024  # 100 GB
+
+CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+UPLOAD_TIMEOUT = 60 * 60 * 12  # 12 hours
 
 MAX_RETRIES = 5
 
-# Only one Telegram upload at a time.
-UPLOAD_LOCK = asyncio.Lock()
+RETRY_BASE_SECONDS = 5
 
 
-# =========================================================
-# VALIDATE CONFIG
-# =========================================================
+# ============================================================
+# GLOBAL TELEGRAM CLIENT
+# ============================================================
 
-def get_api_id() -> int:
-    try:
-        return int(API_ID_TEXT)
-    except (TypeError, ValueError):
-        raise RuntimeError(
-            "API_ID is missing or invalid."
-        )
+telegram_client: TelegramClient | None = None
+telegram_entity = None
+
+upload_lock = asyncio.Lock()
 
 
-def get_channel_id():
-    if not CHANNEL_ID_TEXT:
-        raise RuntimeError(
-            "CHANNEL_ID is missing."
-        )
+# ============================================================
+# FILE HELPERS
+# ============================================================
 
-    # Numeric channel ID
-    try:
-        return int(CHANNEL_ID_TEXT)
-    except ValueError:
-        # Username such as @mychannel
-        return CHANNEL_ID_TEXT
-
-
-# =========================================================
-# FASTAPI
-# =========================================================
-
-app = FastAPI(
-    title="Telegram Large File Auto Uploader",
-    version="3.0.0"
-)
-
-
-# =========================================================
-# TELEGRAM CLIENT
-# =========================================================
-
-telegram_client: Optional[TelegramClient] = None
-
-
-async def get_telegram_client() -> TelegramClient:
-
-    global telegram_client
-
-    if telegram_client is not None:
-
-        if not telegram_client.is_connected():
-            await telegram_client.connect()
-
-        return telegram_client
-
-    if not SESSION_STRING:
-        raise RuntimeError(
-            "SESSION_STRING is missing."
-        )
-
-    api_id = get_api_id()
-
-    telegram_client = TelegramClient(
-        StringSession(SESSION_STRING),
-        api_id,
-        API_HASH
-    )
-
-    await telegram_client.connect()
-
-    if not await telegram_client.is_user_authorized():
-
-        await telegram_client.disconnect()
-
-        telegram_client = None
-
-        raise RuntimeError(
-            "Telegram session is not authorized."
-        )
-
-    return telegram_client
-
-
-# =========================================================
-# HASH DATABASE
-# =========================================================
-
-def load_uploaded_files() -> dict:
-
-    try:
-
-        if not STATE_FILE.exists():
-            return {}
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        if isinstance(data, dict):
-            return data
-
-    except Exception:
-        pass
-
-    return {}
-
-
-def save_uploaded_files(data: dict) -> None:
-
-    temporary_file = STATE_FILE.with_suffix(
-        ".tmp"
-    )
-
-    try:
-
-        with open(
-            temporary_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        os.replace(
-            temporary_file,
-            STATE_FILE
-        )
-
-    except Exception:
-
-        try:
-
-            if temporary_file.exists():
-                temporary_file.unlink()
-
-        except Exception:
-            pass
-
-
-# =========================================================
-# SHA256
-# =========================================================
-
-def calculate_sha256(
-    path: Path
-) -> str:
-
-    sha256 = hashlib.sha256()
-
-    with open(
-        path,
-        "rb"
-    ) as file:
-
-        while True:
-
-            chunk = file.read(
-                1024 * 1024
-            )
-
-            if not chunk:
-                break
-
-            sha256.update(chunk)
-
-    return sha256.hexdigest()
-
-
-# =========================================================
-# SAFE FILENAME
-# =========================================================
-
-def safe_filename(
-    filename: Optional[str]
-) -> str:
-
+def safe_filename(filename: str | None) -> str:
     if not filename:
         return "uploaded_file"
 
-    name = Path(
-        filename
-    ).name
+    name = Path(filename).name
 
-    name = name.replace(
-        "\x00",
-        ""
-    ).strip()
+    # Remove dangerous/null characters.
+    name = name.replace("\x00", "")
 
     if not name:
         return "uploaded_file"
@@ -248,438 +124,510 @@ def safe_filename(
     return name
 
 
-# =========================================================
-# TELEGRAM UPLOAD
-# =========================================================
+def get_mime(filename: str) -> str:
+    mime, _ = mimetypes.guess_type(filename)
 
-async def send_file_to_telegram(
-    path: Path,
-    filename: str
-) -> dict:
+    if mime:
+        return mime
 
-    client = await get_telegram_client()
-
-    channel = get_channel_id()
-
-    last_error = None
-
-    for attempt in range(
-        1,
-        MAX_RETRIES + 1
-    ):
-
-        try:
-
-            message = await client.send_file(
-                entity=channel,
-                file=str(path),
-                force_document=True,
-                attributes=[
-                    DocumentAttributeFilename(
-                        file_name=filename
-                    )
-                ]
-            )
-
-            return {
-                "success": True,
-                "attempt": attempt,
-                "message_id": message.id
-            }
-
-        except FloodWaitError as error:
-
-            last_error = (
-                f"Telegram FloodWait: "
-                f"{error.seconds} seconds"
-            )
-
-            await asyncio.sleep(
-                error.seconds
-            )
-
-        except Exception as error:
-
-            last_error = str(error)
-
-            if attempt < MAX_RETRIES:
-
-                await asyncio.sleep(
-                    min(
-                        attempt * 5,
-                        60
-                    )
-                )
-
-    return {
-        "success": False,
-        "attempt": MAX_RETRIES,
-        "error": last_error
-    }
+    return "application/octet-stream"
 
 
-# =========================================================
-# STARTUP
-# =========================================================
+def is_image(filename: str) -> bool:
+    return get_mime(filename).startswith("image/")
 
-@app.on_event("startup")
-async def startup_event():
+
+def is_video(filename: str) -> bool:
+    return get_mime(filename).startswith("video/")
+
+
+def is_audio(filename: str) -> bool:
+    return get_mime(filename).startswith("audio/")
+
+
+def human_size(size: int) -> str:
+    value = float(size)
+
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if value < 1024:
+            return f"{value:.2f} {unit}"
+
+        value /= 1024
+
+    return f"{value:.2f} PB"
+
+
+# ============================================================
+# TELEGRAM STARTUP
+# ============================================================
+
+async def start_telegram():
+    global telegram_client
+    global telegram_entity
+
+    log.info("Starting Telegram client...")
+
+    telegram_client = TelegramClient(
+        SESSION_STRING,
+        TELEGRAM_API_ID,
+        TELEGRAM_API_HASH,
+        device_model="Telegram Auto Uploader",
+        system_version="Android",
+        app_version="1.0",
+        lang_code="en",
+        system_lang_code="en",
+        auto_reconnect=True,
+        connection_retries=10,
+        retry_delay=5,
+    )
 
     try:
+        await telegram_client.connect()
 
-        await get_telegram_client()
+        if not await telegram_client.is_user_authorized():
+            raise RuntimeError(
+                "SESSION_STRING is not authorized. "
+                "Generate a valid Telethon session string."
+            )
 
-        print(
-            "Telegram client connected successfully."
+        me = await telegram_client.get_me()
+
+        if me:
+            username = getattr(me, "username", None)
+            first_name = getattr(me, "first_name", "")
+
+            log.info(
+                "Telegram connected as: %s %s",
+                first_name or "",
+                f"@{username}" if username else "",
+            )
+
+        telegram_entity = await telegram_client.get_entity(
+            CHANNEL_ID
         )
 
-    except Exception as error:
+        log.info("Telegram target channel resolved successfully.")
 
-        print(
-            "Telegram startup warning:",
-            error
+        # Test whether the account can access the target.
+        await telegram_client.get_permissions(
+            telegram_entity,
+            me,
         )
 
-        # Do not crash FastAPI.
-        # The endpoint will report the actual error.
+        log.info("Telegram channel access verified.")
 
+    except Exception:
+        log.exception("Telegram startup failed.")
 
-# =========================================================
-# SHUTDOWN
-# =========================================================
-
-@app.on_event("shutdown")
-async def shutdown_event():
-
-    global telegram_client
-
-    if telegram_client is not None:
-
-        try:
-            await telegram_client.disconnect()
-        except Exception:
-            pass
+        if telegram_client:
+            try:
+                await telegram_client.disconnect()
+            except Exception:
+                pass
 
         telegram_client = None
+        telegram_entity = None
+
+        raise
 
 
-# =========================================================
-# HOME
-# =========================================================
+# ============================================================
+# TELEGRAM UPLOAD
+# ============================================================
+
+async def upload_to_telegram(
+    file_path: str,
+    filename: str,
+    file_size: int,
+):
+    if telegram_client is None:
+        raise RuntimeError("Telegram client is not running.")
+
+    if telegram_entity is None:
+        raise RuntimeError("Telegram channel is not available.")
+
+    log.info(
+        "Telegram upload starting: %s (%s)",
+        filename,
+        human_size(file_size),
+    )
+
+    last_progress = -1
+
+    def progress_callback(current: int, total: int):
+        nonlocal last_progress
+
+        if total <= 0:
+            return
+
+        percent = int((current / total) * 100)
+
+        # Log every 5%.
+        rounded = (percent // 5) * 5
+
+        if rounded != last_progress:
+            last_progress = rounded
+
+            log.info(
+                "Uploading %s: %d%%",
+                filename,
+                percent,
+            )
+
+    mime = get_mime(filename)
+
+    # Preserve normal Telegram media behaviour:
+    # images -> photo where supported
+    # videos -> video where supported
+    # everything else -> document
+    force_document = not (
+        is_image(filename)
+        or is_video(filename)
+        or is_audio(filename)
+    )
+
+    # Video attributes are optional. We only use normal send_file
+    # for maximum compatibility.
+    kwargs = {
+        "caption": filename,
+        "force_document": force_document,
+        "supports_streaming": is_video(filename),
+        "progress_callback": progress_callback,
+    }
+
+    # Retry temporary Telegram/network failures.
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+            message = await telegram_client.send_file(
+                telegram_entity,
+                file_path,
+                **kwargs,
+            )
+
+            log.info(
+                "Telegram upload completed: %s",
+                filename,
+            )
+
+            return message
+
+        except FloodWaitError as exc:
+            wait_seconds = int(exc.seconds)
+
+            log.warning(
+                "Telegram FloodWait: waiting %s seconds.",
+                wait_seconds,
+            )
+
+            await asyncio.sleep(wait_seconds)
+
+        except (ConnectionError, TimeoutError) as exc:
+            if attempt >= MAX_RETRIES:
+                raise
+
+            delay = RETRY_BASE_SECONDS * attempt
+
+            log.warning(
+                "Temporary network error on attempt %d/%d: %s. "
+                "Retrying in %d seconds.",
+                attempt,
+                MAX_RETRIES,
+                exc,
+                delay,
+            )
+
+            await asyncio.sleep(delay)
+
+        except RPCError as exc:
+            # Retry a few times for transient Telegram RPC errors.
+            if attempt >= MAX_RETRIES:
+                raise
+
+            delay = RETRY_BASE_SECONDS * attempt
+
+            log.warning(
+                "Telegram RPC error on attempt %d/%d: %s. "
+                "Retrying in %d seconds.",
+                attempt,
+                MAX_RETRIES,
+                exc,
+                delay,
+            )
+
+            await asyncio.sleep(delay)
+
+    raise RuntimeError(
+        "Telegram upload failed after all retries."
+    )
+
+
+# ============================================================
+# FASTAPI LIFESPAN
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    log.info("Application startup.")
+
+    try:
+        await start_telegram()
+
+        log.info(
+            "Telegram Auto Uploader is ready."
+        )
+
+        yield
+
+    except Exception:
+        log.exception(
+            "Application startup failed."
+        )
+
+        # Keep FastAPI alive so Railway can show logs,
+        # but Telegram upload endpoints will report the issue.
+        yield
+
+    finally:
+        log.info("Application shutting down.")
+
+        if telegram_client:
+            try:
+                await telegram_client.disconnect()
+                log.info("Telegram client disconnected.")
+            except Exception:
+                log.exception(
+                    "Error while disconnecting Telegram."
+                )
+
+
+# ============================================================
+# FASTAPI APP
+# ============================================================
+
+app = FastAPI(
+    title="Telegram Auto Uploader",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
 async def home():
 
+    telegram_ok = (
+        telegram_client is not None
+        and telegram_client.is_connected()
+    )
+
     return {
-        "status": "online",
-        "service": "Telegram Large File Auto Uploader",
-        "version": "3.0.0",
-        "protocol": "MTProto",
-        "large_files": True
+        "status": "running",
+        "telegram_connected": telegram_ok,
+        "service": "Telegram Auto Uploader",
     }
 
-
-# =========================================================
-# HEALTH
-# =========================================================
 
 @app.get("/health")
 async def health():
 
-    try:
-
-        client = await get_telegram_client()
-
-        me = await client.get_me()
-
-        return {
-            "status": "healthy",
-            "telegram_connected": True,
-            "telegram_user": (
-                getattr(
-                    me,
-                    "username",
-                    None
-                )
-                or getattr(
-                    me,
-                    "first_name",
-                    None
-                )
-            )
-        }
-
-    except Exception as error:
-
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "unhealthy",
-                "telegram_connected": False,
-                "error": str(error)
-            }
-        )
-
-
-# =========================================================
-# UPLOAD
-# =========================================================
-
-@app.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...)
-):
-
-    filename = safe_filename(
-        file.filename
+    telegram_ok = (
+        telegram_client is not None
+        and telegram_client.is_connected()
     )
 
-    temporary_path: Optional[Path] = None
+    return {
+        "ok": telegram_ok,
+        "telegram_connected": telegram_ok,
+    }
 
-    async with UPLOAD_LOCK:
+
+# ============================================================
+# UPLOAD ENDPOINT
+# ============================================================
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+
+    filename = safe_filename(file.filename)
+
+    log.info(
+        "Incoming upload: %s",
+        filename,
+    )
+
+    if telegram_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram client is not connected.",
+        )
+
+    # Only one large upload at a time.
+    # This prevents RAM/disk/network overload.
+    async with upload_lock:
+
+        temp_path = None
+        total_size = 0
 
         try:
 
-            # -------------------------------------------------
-            # SAVE UPLOADED FILE TO DISK
-            # -------------------------------------------------
+            # ------------------------------------------------
+            # Create temporary file.
+            # ------------------------------------------------
 
-            suffix = Path(
-                filename
-            ).suffix
+            suffix = Path(filename).suffix
 
-            with NamedTemporaryFile(
+            temp_file = tempfile.NamedTemporaryFile(
                 mode="wb",
                 delete=False,
                 suffix=suffix,
-                dir=TEMP_DIR
-            ) as temporary_file:
-
-                temporary_path = Path(
-                    temporary_file.name
-                )
-
-                while True:
-
-                    chunk = await file.read(
-                        1024 * 1024
-                    )
-
-                    if not chunk:
-                        break
-
-                    temporary_file.write(
-                        chunk
-                    )
-
-            # -------------------------------------------------
-            # CHECK FILE
-            # -------------------------------------------------
-
-            if not temporary_path.exists():
-
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "success": False,
-                        "safe_to_delete": False,
-                        "error": (
-                            "Temporary file "
-                            "was not created."
-                        )
-                    }
-                )
-
-            file_size = (
-                temporary_path.stat().st_size
+                prefix="telegram_upload_",
             )
 
-            if file_size <= 0:
+            temp_path = temp_file.name
 
-                return JSONResponse(
+            log.info(
+                "Temporary file: %s",
+                temp_path,
+            )
+
+            # ------------------------------------------------
+            # Stream incoming file to disk.
+            # ------------------------------------------------
+
+            while True:
+
+                chunk = await file.read(CHUNK_SIZE)
+
+                if not chunk:
+                    break
+
+                total_size += len(chunk)
+
+                if total_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "File exceeds application "
+                            "size limit."
+                        ),
+                    )
+
+                temp_file.write(chunk)
+
+            temp_file.flush()
+            temp_file.close()
+
+            if total_size <= 0:
+                raise HTTPException(
                     status_code=400,
-                    content={
-                        "success": False,
-                        "safe_to_delete": False,
-                        "error": "Empty file."
-                    }
+                    detail="Empty file.",
                 )
 
-            # -------------------------------------------------
-            # HASH
-            # -------------------------------------------------
-
-            file_hash = await asyncio.to_thread(
-                calculate_sha256,
-                temporary_path
+            log.info(
+                "Download/receive completed: %s (%s)",
+                filename,
+                human_size(total_size),
             )
 
-            uploaded_files = (
-                load_uploaded_files()
+            # ------------------------------------------------
+            # Upload to Telegram.
+            # ------------------------------------------------
+
+            message = await upload_to_telegram(
+                temp_path,
+                filename,
+                total_size,
             )
 
-            # -------------------------------------------------
-            # DUPLICATE
-            # -------------------------------------------------
-
-            if file_hash in uploaded_files:
-
-                return {
-                    "success": True,
-                    "duplicate": True,
-                    "filename": filename,
-                    "size": file_size,
-                    "sha256": file_hash,
-                    "safe_to_delete": True,
-                    "message": (
-                        "File was already "
-                        "uploaded successfully."
-                    )
-                }
-
-            # -------------------------------------------------
-            # TELEGRAM
-            # -------------------------------------------------
-
-            result = await send_file_to_telegram(
-                temporary_path,
-                filename
+            message_id = getattr(
+                message,
+                "id",
+                None,
             )
 
-            # -------------------------------------------------
+            # ------------------------------------------------
             # SUCCESS
-            # -------------------------------------------------
-
-            if result.get("success"):
-
-                uploaded_files[file_hash] = {
-                    "filename": filename,
-                    "size": file_size,
-                    "message_id": result.get(
-                        "message_id"
-                    ),
-                    "timestamp": int(
-                        time.time()
-                    )
-                }
-
-                save_uploaded_files(
-                    uploaded_files
-                )
-
-                return {
-                    "success": True,
-                    "duplicate": False,
-                    "filename": filename,
-                    "size": file_size,
-                    "sha256": file_hash,
-                    "attempts": result.get(
-                        "attempt"
-                    ),
-                    "message_id": result.get(
-                        "message_id"
-                    ),
-
-                    # Android deletes the
-                    # original only after this.
-                    "safe_to_delete": True,
-
-                    "message": (
-                        "Telegram upload "
-                        "completed successfully."
-                    )
-                }
-
-            # -------------------------------------------------
-            # FAILURE
-            # -------------------------------------------------
+            # ------------------------------------------------
 
             return JSONResponse(
-                status_code=502,
-                content={
-                    "success": False,
+                {
+                    "success": True,
                     "filename": filename,
-                    "size": file_size,
-                    "safe_to_delete": False,
-                    "attempts": result.get(
-                        "attempt"
+                    "size": total_size,
+                    "size_human": human_size(total_size),
+                    "telegram_message_id": message_id,
+                    "message": (
+                        "Uploaded to Telegram successfully."
                     ),
-                    "error": result.get(
-                        "error"
-                    )
                 }
             )
 
-        except Exception as error:
+        except HTTPException:
+            raise
 
-            return JSONResponse(
+        except Exception as exc:
+
+            log.exception(
+                "Upload failed: %s",
+                filename,
+            )
+
+            raise HTTPException(
                 status_code=500,
-                content={
-                    "success": False,
-                    "filename": filename,
-                    "safe_to_delete": False,
-                    "error": str(error)
-                }
+                detail=f"Upload failed: {str(exc)}",
             )
 
         finally:
+
+            # ------------------------------------------------
+            # ALWAYS delete temporary file.
+            # ------------------------------------------------
+
+            if temp_path:
+
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+                        log.info(
+                            "Temporary file deleted: %s",
+                            filename,
+                        )
+
+                except Exception:
+                    log.exception(
+                        "Could not delete temporary file: %s",
+                        temp_path,
+                    )
 
             try:
                 await file.close()
             except Exception:
                 pass
 
-            # -------------------------------------------------
-            # SERVER TEMP FILE CLEANUP
-            # -------------------------------------------------
 
-            if temporary_path is not None:
+# ============================================================
+# RAILWAY ENTRY POINT
+# ============================================================
 
-                try:
+if __name__ == "__main__":
 
-                    if temporary_path.exists():
-                        temporary_path.unlink()
+    import uvicorn
 
-                except Exception:
-                    pass
+    port = int(
+        os.getenv(
+            "PORT",
+            "8080",
+        )
+    )
 
-
-# =========================================================
-# TELEGRAM TEST
-# =========================================================
-
-@app.get("/telegram-test")
-async def telegram_test():
-
-    try:
-
-        client = await get_telegram_client()
-
-        me = await client.get_me()
-
-        return {
-            "success": True,
-            "connected": True,
-            "id": me.id,
-            "username": getattr(
-                me,
-                "username",
-                None
-            ),
-            "name": getattr(
-                me,
-                "first_name",
-                None
-            )
-        }
-
-    except Exception as error:
-
-        return JSONResponse(
-            status_code=503,
-            content={
-                "success": False,
-                "connected": False,
-                "error": str(error)
-            }
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
     )
