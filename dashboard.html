@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telegram Auto Uploader</title>
+
+<style>
+*{box-sizing:border-box}
+body{
+    margin:0;
+    font-family:Arial,sans-serif;
+    background:#0f1117;
+    color:#fff;
+}
+.header{
+    padding:20px;
+    background:#171a22;
+    border-bottom:1px solid #292d38;
+}
+.header h1{margin:0;font-size:22px}
+.status{
+    margin-top:8px;
+    color:#4ade80;
+    font-size:14px;
+}
+.container{
+    max-width:900px;
+    margin:auto;
+    padding:20px;
+}
+.card{
+    background:#171a22;
+    border:1px solid #292d38;
+    border-radius:14px;
+    padding:18px;
+    margin-bottom:16px;
+}
+input[type=file]{
+    width:100%;
+    padding:14px;
+    background:#0f1117;
+    color:#fff;
+    border:1px solid #333846;
+    border-radius:10px;
+}
+button{
+    border:0;
+    border-radius:9px;
+    padding:11px 16px;
+    margin:8px 5px 0 0;
+    cursor:pointer;
+    font-weight:bold;
+}
+.upload{
+    background:#4f8cff;
+    color:white;
+}
+.cancel{
+    background:#ef4444;
+    color:white;
+}
+.retry{
+    background:#f59e0b;
+    color:white;
+}
+.progress-box{
+    margin-top:15px;
+}
+.progress{
+    width:100%;
+    height:12px;
+    background:#292d38;
+    border-radius:20px;
+    overflow:hidden;
+}
+.progress-bar{
+    width:0%;
+    height:100%;
+    background:#4f8cff;
+    transition:width .3s;
+}
+.info{
+    margin-top:10px;
+    color:#b8becb;
+    font-size:14px;
+    line-height:1.7;
+}
+.jobs{
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+}
+.job{
+    background:#10131a;
+    border:1px solid #292d38;
+    border-radius:12px;
+    padding:15px;
+}
+.job-name{
+    font-weight:bold;
+    word-break:break-all;
+}
+.job-status{
+    margin-top:5px;
+    color:#b8becb;
+}
+.success{color:#4ade80}
+.error{color:#f87171}
+.small{
+    color:#8d95a5;
+    font-size:13px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="header">
+    <h1>🚀 Telegram Auto Uploader</h1>
+    <div class="status" id="serverStatus">
+        ● Checking server...
+    </div>
+</div>
+
+<div class="container">
+
+    <div class="card">
+
+        <h2>📤 Upload File</h2>
+
+        <input
+            type="file"
+            id="fileInput"
+        >
+
+        <button
+            class="upload"
+            onclick="startUpload()"
+        >
+            Upload
+        </button>
+
+        <div class="progress-box">
+
+            <div class="progress">
+                <div
+                    class="progress-bar"
+                    id="progressBar"
+                ></div>
+            </div>
+
+            <div
+                class="info"
+                id="uploadInfo"
+            >
+                No active upload
+            </div>
+
+            <button
+                class="cancel"
+                id="cancelBtn"
+                onclick="cancelUpload()"
+                style="display:none"
+            >
+                ❌ Cancel
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <h2>📋 Jobs</h2>
+
+        <div
+            class="jobs"
+            id="jobs"
+        >
+            <div class="small">
+                No jobs yet.
+            </div>
+        </div>
+
+    </div>
+
+</div>
+
+
+<script>
+
+let currentRequest = null;
+
+const API_BASE = "";
+
+
+/* -----------------------------------------
+   SERVER STATUS
+----------------------------------------- */
+
+async function checkServer(){
+
+    try{
+
+        const response =
+            await fetch("/health");
+
+        const data =
+            await response.json();
+
+        const status =
+            document.getElementById(
+                "serverStatus"
+            );
+
+        if(data.telegram_connected){
+
+            status.innerHTML =
+                "🟢 Telegram Connected";
+
+        }else{
+
+            status.innerHTML =
+                "🔴 Telegram Disconnected";
+
+        }
+
+    }catch(error){
+
+        document.getElementById(
+            "serverStatus"
+        ).innerHTML =
+            "🔴 Server Offline";
+    }
+}
+
+
+/* -----------------------------------------
+   FORMAT SIZE
+----------------------------------------- */
+
+function formatSize(bytes){
+
+    if(bytes < 1024)
+        return bytes + " B";
+
+    if(bytes < 1024*1024)
+        return (bytes/1024).toFixed(2) + " KB";
+
+    if(bytes < 1024*1024*1024)
+        return (bytes/1024/1024).toFixed(2) + " MB";
+
+    return (
+        bytes/
+        1024/
+        1024/
+        1024
+    ).toFixed(2) + " GB";
+}
+
+
+/* -----------------------------------------
+   UPLOAD
+----------------------------------------- */
+
+function startUpload(){
+
+    const input =
+        document.getElementById(
+            "fileInput"
+        );
+
+    if(!input.files.length){
+
+        alert("Please select a file.");
+
+        return;
+    }
+
+    const file =
+        input.files[0];
+
+    const formData =
+        new FormData();
+
+    formData.append(
+        "file",
+        file
+    );
+
+    const progressBar =
+        document.getElementById(
+            "progressBar"
+        );
+
+    const uploadInfo =
+        document.getElementById(
+            "uploadInfo"
+        );
+
+    const cancelBtn =
+        document.getElementById(
+            "cancelBtn"
+        );
+
+    progressBar.style.width =
+        "0%";
+
+    cancelBtn.style.display =
+        "inline-block";
+
+
+    addJob(
+        file.name,
+        file.size
+    );
+
+
+    currentRequest =
+        new XMLHttpRequest();
+
+    currentRequest.open(
+        "POST",
+        "/upload",
+        true
+    );
+
+
+    currentRequest.upload.onprogress =
+        function(event){
+
+            if(!event.lengthComputable)
+                return;
+
+            const percent =
+                Math.round(
+                    event.loaded /
+                    event.total *
+                    100
+                );
+
+            progressBar.style.width =
+                percent + "%";
+
+            uploadInfo.innerHTML =
+                "⬇️ Sending: " +
+                percent +
+                "%<br>" +
+
+                "📄 File: " +
+                file.name +
+                "<br>" +
+
+                "💾 Size: " +
+                formatSize(
+                    file.size
+                );
+        };
+
+
+    currentRequest.onload =
+        function(){
+
+            cancelBtn.style.display =
+                "none";
+
+            if(
+                currentRequest.status >= 200 &&
+                currentRequest.status < 300
+            ){
+
+                progressBar.style.width =
+                    "100%";
+
+                uploadInfo.innerHTML =
+                    "✅ Upload request completed.";
+
+                updateLastJob(
+                    "Completed"
+                );
+
+            }else{
+
+                uploadInfo.innerHTML =
+                    "❌ Upload failed.";
+
+                updateLastJob(
+                    "Failed"
+                );
+            }
+
+            currentRequest = null;
+        };
+
+
+    currentRequest.onerror =
+        function(){
+
+            cancelBtn.style.display =
+                "none";
+
+            uploadInfo.innerHTML =
+                "❌ Network error.";
+
+            updateLastJob(
+                "Failed"
+            );
+
+            currentRequest = null;
+        };
+
+
+    currentRequest.onabort =
+        function(){
+
+            cancelBtn.style.display =
+                "none";
+
+            uploadInfo.innerHTML =
+                "❌ Upload cancelled.";
+
+            updateLastJob(
+                "Cancelled"
+            );
+
+            currentRequest = null;
+        };
+
+
+    currentRequest.send(
+        formData
+    );
+}
+
+
+/* -----------------------------------------
+   CANCEL
+----------------------------------------- */
+
+function cancelUpload(){
+
+    if(currentRequest){
+
+        currentRequest.abort();
+
+        currentRequest = null;
+    }
+}
+
+
+/* -----------------------------------------
+   JOB LIST
+----------------------------------------- */
+
+let jobCount = 0;
+
+function addJob(
+    name,
+    size
+){
+
+    jobCount++;
+
+    const jobs =
+        document.getElementById(
+            "jobs"
+        );
+
+    if(
+        jobs.children.length === 1 &&
+        jobs.children[0]
+            .classList
+            .contains("small")
+    ){
+
+        jobs.innerHTML = "";
+    }
+
+
+    const job =
+        document.createElement(
+            "div"
+        );
+
+    job.className =
+        "job";
+
+    job.innerHTML =
+
+        `<div class="job-name">
+            📄 ${escapeHtml(name)}
+        </div>
+
+        <div class="job-status">
+            ⏳ Uploading...
+        </div>
+
+        <div class="small">
+            ${formatSize(size)}
+        </div>`;
+
+    jobs.prepend(job);
+}
+
+
+function updateLastJob(
+    status
+){
+
+    const jobs =
+        document.getElementById(
+            "jobs"
+        );
+
+    if(!jobs.children.length)
+        return;
+
+    const job =
+        jobs.children[0];
+
+    const statusElement =
+        job.querySelector(
+            ".job-status"
+        );
+
+    statusElement.textContent =
+        status;
+
+    if(status === "Completed")
+        statusElement.className =
+            "job-status success";
+
+    if(status === "Failed")
+        statusElement.className =
+            "job-status error";
+}
+
+
+/* -----------------------------------------
+   SECURITY
+----------------------------------------- */
+
+function escapeHtml(text){
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+    div.textContent = text;
+
+    return div.innerHTML;
+}
+
+
+/* -----------------------------------------
+   START
+----------------------------------------- */
+
+checkServer();
+
+setInterval(
+    checkServer,
+    10000
+);
+
+</script>
+
+</body>
+</html>
